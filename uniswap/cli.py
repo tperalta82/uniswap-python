@@ -1,17 +1,26 @@
 import logging
+import os
 
 import click
 from dotenv import load_dotenv
 from web3 import Web3
+from typing import Optional
 
 from .uniswap import Uniswap, AddressLike, _str_to_addr
-from .tokens import tokens
+from .token import BaseToken
+from .tokens import get_tokens
+from .constants import ETH_ADDRESS
 
 
 logger = logging.getLogger(__name__)
 
+# Global used in _coerce_to_checksum to look up tokens
+_uni: Optional[Uniswap] = None
+
 
 def _coerce_to_checksum(addr: str) -> str:
+    assert _uni
+    tokens = get_tokens(_uni.netname)
     if not addr.startswith("0x"):
         if addr.upper() in tokens:
             return tokens[addr.upper()]
@@ -22,13 +31,16 @@ def _coerce_to_checksum(addr: str) -> str:
     if Web3.isChecksumAddress(addr):
         return addr
     else:
-        # logger.warning("Address wasn't in checksum format, coercing")
-        return Web3.toChecksumAddress(addr)  # type: ignore
+        return Web3.toChecksumAddress(addr)
 
 
 @click.group()
 @click.option("-v", "--verbose", is_flag=True)
-@click.option("--version", type=click.Choice(["1", "2"]), default="2")
+@click.option(
+    "--version",
+    type=click.Choice(["1", "2", "3"]),
+    default=os.getenv("UNISWAP_VERSION", "3"),
+)
 @click.pass_context
 def main(ctx: click.Context, verbose: bool, version: str) -> None:
     logging.basicConfig(level=logging.INFO if verbose else logging.WARNING)
@@ -37,6 +49,8 @@ def main(ctx: click.Context, verbose: bool, version: str) -> None:
     ctx.ensure_object(dict)
     ctx.obj["VERBOSE"] = verbose
     ctx.obj["UNISWAP"] = Uniswap(None, None, version=int(version))
+    global _uni
+    _uni = ctx.obj["UNISWAP"]
 
 
 @main.command()
@@ -60,15 +74,22 @@ def price(
     quantity: int = None,
 ) -> None:
     """Returns the price of ``quantity`` tokens of ``token_in`` quoted in ``token_out``."""
-    uni = ctx.obj["UNISWAP"]
+    uni: Uniswap = ctx.obj["UNISWAP"]
     if quantity is None:
-        quantity = 10 ** uni.get_token(token_in)["decimals"]
-    price = uni.get_token_token_input_price(token_in, token_out, qty=quantity)
+        if token_in == ETH_ADDRESS:
+            decimals = 18
+        else:
+            decimals = uni.get_token(token_in).decimals
+        quantity = 10**decimals
+    price = uni.get_price_input(token_in, token_out, qty=quantity)
     if raw:
-        print(price)
+        click.echo(price)
     else:
-        decimals = uni.get_token(token_out)["decimals"]
-        print(price / 10 ** decimals)
+        if token_in == ETH_ADDRESS:
+            decimals = 18
+        else:
+            decimals = uni.get_token(token_out).decimals
+        click.echo(price / 10**decimals)
 
 
 @main.command()
@@ -76,9 +97,9 @@ def price(
 @click.pass_context
 def token(ctx: click.Context, token: AddressLike) -> None:
     """Show metadata for token"""
-    uni = ctx.obj["UNISWAP"]
+    uni: Uniswap = ctx.obj["UNISWAP"]
     t1 = uni.get_token(token)
-    print(t1)
+    click.echo(t1)
 
 
 @main.command()
@@ -86,12 +107,11 @@ def token(ctx: click.Context, token: AddressLike) -> None:
 @click.pass_context
 def tokendb(ctx: click.Context, metadata: bool) -> None:
     """List known token addresses"""
-    uni = ctx.obj["UNISWAP"]
-    for symbol, addr in tokens.items():
-        if metadata:
+    uni: Uniswap = ctx.obj["UNISWAP"]
+    for symbol, addr in get_tokens(uni.netname).items():
+        if metadata and addr != "0x0000000000000000000000000000000000000000":
             data = uni.get_token(_str_to_addr(addr))
-            data["address"] = addr
-            assert data["symbol"].lower() == symbol.lower()
-            print(data)
+            assert data.symbol.lower() == symbol.lower()
+            click.echo(data)
         else:
-            print({"symbol": symbol, "address": addr})
+            click.echo(BaseToken(symbol, addr))

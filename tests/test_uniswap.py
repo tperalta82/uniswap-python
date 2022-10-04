@@ -2,14 +2,37 @@ import pytest
 import os
 import subprocess
 import shutil
+import logging
 from typing import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from time import sleep
 
 from web3 import Web3
+from web3.exceptions import NameNotFound
 
-from uniswap import Uniswap, InvalidToken, InsufficientBalance
+from uniswap import Uniswap, token
+from uniswap.constants import ETH_ADDRESS, WETH9_ADDRESS
+from uniswap.exceptions import InsufficientBalance
+from uniswap.tokens import get_tokens
+from uniswap.util import (
+    _str_to_addr,
+    default_tick_range,
+    _addr_to_str,
+    _load_contract_erc20,
+)
+
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+ENV_UNISWAP_VERSION = os.getenv("UNISWAP_VERSION", None)
+if ENV_UNISWAP_VERSION:
+    UNISWAP_VERSIONS = [int(ENV_UNISWAP_VERSION)]
+else:
+    UNISWAP_VERSIONS = [1, 2, 3]
+
+RECEIPT_TIMEOUT = 5
 
 
 @dataclass
@@ -19,38 +42,76 @@ class GanacheInstance:
     eth_privkey: str
 
 
-@pytest.fixture(scope="module", params=[1, 2])
+@pytest.fixture(scope="module", params=UNISWAP_VERSIONS)
 def client(request, web3: Web3, ganache: GanacheInstance):
-    uniswap = Uniswap(
-        ganache.eth_address, ganache.eth_privkey, web3=web3, version=request.param
+    return Uniswap(
+        ganache.eth_address,
+        ganache.eth_privkey,
+        web3=web3,
+        version=request.param,
+        use_estimate_gas=False,  # see note in _build_and_send_tx
     )
-    uniswap._buy_test_assets()
-    return uniswap
+
+
+@pytest.fixture(scope="function", params=UNISWAP_VERSIONS)
+def tokens(client: Uniswap):
+    return get_tokens(client.netname)
+
+
+@pytest.fixture(scope="module")
+def test_assets(client: Uniswap):
+    """
+    Buy some DAI and USDC to test with.
+    """
+    tokens = get_tokens(client.netname)
+
+    for token_name, amount in [("DAI", 100 * 10 ** 18), ("USDC", 100 * 10 ** 6)]:
+        token_addr = tokens[token_name]
+        price = client.get_price_output(_str_to_addr(ETH_ADDRESS), token_addr, amount)
+        logger.info(f"Cost of {amount} {token_name}: {price}")
+        logger.info("Buying...")
+
+        tx = client.make_trade_output(tokens["ETH"], token_addr, amount)
+        client.w3.eth.wait_for_transaction_receipt(tx, timeout=RECEIPT_TIMEOUT)
 
 
 @pytest.fixture(scope="module")
 def web3(ganache: GanacheInstance):
-    return Web3(Web3.HTTPProvider(ganache.provider, request_kwargs={"timeout": 60}))
+    w3 = Web3(Web3.HTTPProvider(ganache.provider, request_kwargs={"timeout": 30}))
+    if 1 != int(w3.net.version):
+        logger.warning("PROVIDER was not a mainnet provider, which the tests require")
+    return w3
 
 
 @pytest.fixture(scope="module")
 def ganache() -> Generator[GanacheInstance, None, None]:
-    """Fixture that runs ganache-cli which has forked off mainnet"""
-    if not shutil.which("ganache-cli"):
+    """Fixture that runs ganache which has forked off mainnet"""
+    if not shutil.which("ganache"):
         raise Exception(
-            "ganache-cli was not found in PATH, you can install it with `npm install -g ganache-cli`"
+            "ganache was not found in PATH, you can install it with `npm install -g ganache`"
         )
-    if "MAINNET_PROVIDER" not in os.environ:
+    if "PROVIDER" not in os.environ:
         raise Exception(
-            "MAINNET_PROVIDER was not set, you need to set it to a mainnet provider (such as Infura) so that we can fork off our testnet"
+            "PROVIDER was not set, you need to set it to a mainnet provider (such as Infura) so that we can fork off our testnet"
         )
 
     port = 10999
+    defaultGasPrice = 1000_000_000_000  # 1000 gwei
     p = subprocess.Popen(
-        f"ganache-cli --port {port} -s test --networkId 1 --fork {os.environ['MAINNET_PROVIDER']}",
+        f"""ganache
+        --port {port}
+        --wallet.seed test
+        --chain.networkId 1
+        --chain.chainId 1
+        --fork.url {os.environ['PROVIDER']}
+        --miner.defaultGasPrice {defaultGasPrice}
+        --miner.instamine "strict"
+        """.replace(
+            "\n", " "
+        ),
         shell=True,
     )
-    # Address #1 when ganache is run with `-s test`, it starts with 100 ETH
+    # Address #1 when ganache is run with `--wallet.seed test`, it starts with 1000 ETH
     eth_address = "0x94e3361495bD110114ac0b6e35Ed75E77E6a6cFA"
     eth_privkey = "0x6f1313062db38875fb01ee52682cbf6a8420e92bfbc578c5d4fdc0a32c50266f"
     sleep(3)
@@ -64,257 +125,380 @@ def does_not_raise():
     yield
 
 
+ONE_ETH = 10 ** 18
+ONE_USDC = 10 ** 6
+
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+
+
 # TODO: Change pytest.param(..., mark=pytest.mark.xfail) to the expectation/raises method
 @pytest.mark.usefixtures("client", "web3")
 class TestUniswap(object):
-    ONE_WEI = 1
-    ONE_ETH = 10 ** 18 * ONE_WEI
-
-    ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
-
-    # TODO: Detect mainnet vs rinkeby and set accordingly, like _get_token_addresses in the Uniswap class
-    # For Mainnet testing (with `ganache-cli --fork` as per the ganache fixture)
-    eth = "0x0000000000000000000000000000000000000000"
-    weth = Web3.toChecksumAddress("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")
-    bat = Web3.toChecksumAddress("0x0D8775F648430679A709E98d2b0Cb6250d2887EF")
-    dai = Web3.toChecksumAddress("0x6b175474e89094c44da98b954eedeac495271d0f")
-
-    # For Rinkeby
-    # eth = "0x0000000000000000000000000000000000000000"
-    # bat = "0xDA5B056Cfb861282B4b59d29c9B395bcC238D29B"
-    # dai = "0x2448eE2641d78CC42D7AD76498917359D961A783"
 
     # ------ Exchange ------------------------------------------------------------------
     def test_get_fee_maker(self, client: Uniswap):
+        if client.version not in [1, 2]:
+            pytest.skip("Tested method not supported in this Uniswap version")
         r = client.get_fee_maker()
         assert r == 0
 
     def test_get_fee_taker(self, client: Uniswap):
+        if client.version not in [1, 2]:
+            pytest.skip("Tested method not supported in this Uniswap version")
         r = client.get_fee_taker()
         assert r == 0.003
 
     # ------ Market --------------------------------------------------------------------
     @pytest.mark.parametrize(
-        "token, qty",
+        "token0, token1, qty, kwargs",
         [
-            (bat, ONE_ETH),
-            (dai, ONE_ETH),
-            (bat, 2 * ONE_ETH),
-            pytest.param("btc", ONE_ETH, marks=pytest.mark.xfail),
+            ("ETH", "UNI", ONE_ETH, {}),
+            ("UNI", "ETH", ONE_ETH, {}),
+            ("ETH", "DAI", ONE_ETH, {}),
+            ("DAI", "ETH", ONE_ETH, {}),
+            ("ETH", "UNI", 2 * ONE_ETH, {}),
+            ("UNI", "ETH", 2 * ONE_ETH, {}),
+            ("WETH", "DAI", ONE_ETH, {}),
+            ("DAI", "WETH", ONE_ETH, {}),
+            ("DAI", "USDC", ONE_ETH, {"fee": 500}),
         ],
     )
-    def test_get_eth_token_input_price(self, client, token, qty):
-        r = client.get_eth_token_input_price(token, qty)
+    def test_get_price_input(self, client, tokens, token0, token1, qty, kwargs):
+        token0, token1 = tokens[token0], tokens[token1]
+        if client.version == 1 and ETH_ADDRESS not in [token0, token1]:
+            pytest.skip("Not supported in this version of Uniswap")
+        r = client.get_price_input(token0, token1, qty, **kwargs)
         assert r
 
     @pytest.mark.parametrize(
-        "token, qty",
+        "token0, token1, qty, kwargs",
         [
-            (bat, ONE_ETH),
-            (dai, ONE_ETH),
-            (bat, 2 * ONE_ETH),
-            pytest.param("btc", ONE_ETH, marks=pytest.mark.xfail),
+            ("ETH", "UNI", ONE_ETH, {}),
+            ("UNI", "ETH", ONE_ETH // 100, {}),
+            ("ETH", "DAI", ONE_ETH, {}),
+            ("DAI", "ETH", ONE_ETH, {}),
+            ("ETH", "UNI", 2 * ONE_ETH, {}),
+            ("WETH", "DAI", ONE_ETH, {}),
+            ("DAI", "WETH", ONE_ETH, {}),
+            ("DAI", "USDC", ONE_USDC, {"fee": 500}),
         ],
     )
-    def test_get_token_eth_input_price(self, client, token, qty):
-        r = client.get_token_eth_input_price(token, qty)
+    def test_get_price_output(self, client, tokens, token0, token1, qty, kwargs):
+        token0, token1 = tokens[token0], tokens[token1]
+        if client.version == 1 and ETH_ADDRESS not in [token0, token1]:
+            pytest.skip("Not supported in this version of Uniswap")
+        r = client.get_price_output(token0, token1, qty, **kwargs)
+        assert r
+
+    @pytest.mark.parametrize("token0, token1, fee", [("DAI", "USDC", 500)])
+    def test_get_raw_price(self, client: Uniswap, tokens, token0, token1, fee):
+        token0, token1 = tokens[token0], tokens[token1]
+        if client.version == 1:
+            pytest.skip("Only supported on Uniswap v2 and v3")
+        r = client.get_raw_price(token0, token1, fee=fee)
         assert r
 
     @pytest.mark.parametrize(
-        "token0, token1, qty",
+        "token0, token1, kwargs",
         [
-            (bat, dai, ONE_ETH),
-            (dai, bat, ONE_ETH),
-            (bat, dai, 2 * ONE_ETH),
-            (weth, dai, ONE_ETH),
-            (dai, weth, ONE_ETH),
+            ("WETH", "DAI", {"fee": 500}),
         ],
     )
-    def test_get_token_token_input_price(self, client, token0, token1, qty):
-        if not client.version == 2:
-            pytest.skip("Tested method only supported on Uniswap v2")
-        r = client.get_token_token_input_price(token0, token1, qty)
+    def test_get_pool_instance(self, client, tokens, token0, token1, kwargs):
+        token0, token1 = tokens[token0], tokens[token1]
+        if client.version != 3:
+            pytest.skip("Not supported in this version of Uniswap")
+        r = client.get_pool_instance(token0, token1, **kwargs)
         assert r
 
     @pytest.mark.parametrize(
-        "token, qty",
+        "token0, token1, kwargs",
         [
-            (bat, ONE_ETH),
-            (dai, ONE_ETH),
-            (bat, 2 * ONE_ETH),
-            pytest.param("btc", ONE_ETH, marks=pytest.mark.xfail),
+            ("WETH", "DAI", {"fee": 500}),
         ],
     )
-    def test_get_eth_token_output_price(self, client, token, qty):
-        r = client.get_eth_token_output_price(token, qty)
+    def test_get_pool_immutables(self, client, tokens, token0, token1, kwargs):
+        token0, token1 = tokens[token0], tokens[token1]
+        if client.version != 3:
+            pytest.skip("Not supported in this version of Uniswap")
+        pool = client.get_pool_instance(token0, token1, **kwargs)
+        r = client.get_pool_immutables(pool)
+        print(r)
         assert r
 
     @pytest.mark.parametrize(
-        "token, qty",
+        "token0, token1, kwargs",
         [
-            (bat, ONE_ETH),
-            (dai, ONE_ETH),
-            (bat, 2 * ONE_ETH),
-            pytest.param("btc", ONE_ETH, marks=pytest.mark.xfail),
+            ("WETH", "DAI", {"fee": 500}),
         ],
     )
-    def test_get_token_eth_output_price(self, client, token, qty):
-        r = client.get_token_eth_output_price(token, qty)
+    def test_get_pool_state(self, client, tokens, token0, token1, kwargs):
+        token0, token1 = tokens[token0], tokens[token1]
+        if client.version != 3:
+            pytest.skip("Not supported in this version of Uniswap")
+        pool = client.get_pool_instance(token0, token1, **kwargs)
+        r = client.get_pool_state(pool)
+        print(r)
         assert r
 
     @pytest.mark.parametrize(
-        "token0, token1, qty",
+        "amount0, amount1, token0, token1, kwargs",
         [
-            (bat, dai, ONE_ETH),
-            (dai, bat, ONE_ETH),
-            (bat, dai, 2 * ONE_ETH),
-            (weth, dai, ONE_ETH),
-            (dai, weth, ONE_ETH),
+            (1, 10, "WETH", "DAI", {"fee": 500}),
         ],
     )
-    def test_get_token_token_output_price(self, client, token0, token1, qty):
-        if not client.version == 2:
-            pytest.skip("Tested method only supported on Uniswap v2")
-        r = client.get_token_token_output_price(token0, token1, qty)
+    def test_mint_position(
+        self, client, tokens, amount0, amount1, token0, token1, kwargs
+    ):
+        token0, token1 = tokens[token0], tokens[token1]
+        if client.version != 3:
+            pytest.skip("Not supported in this version of Uniswap")
+        pool = client.get_pool_instance(token0, token1, **kwargs)
+        r = client.mint_position(pool, amount0, amount1)
+        print(r)
         assert r
 
     # ------ ERC20 Pool ----------------------------------------------------------------
-    @pytest.mark.parametrize("token", [(bat), (dai)])
+    @pytest.mark.parametrize("token", [("UNI"), ("DAI")])
     def test_get_ex_eth_balance(
-        self, client: Uniswap, token,
+        self,
+        client: Uniswap,
+        tokens,
+        token,
     ):
         if not client.version == 1:
-            pytest.skip("Tested method only supported on Uniswap v1")
-        r = client.get_ex_eth_balance(token)
+            pytest.skip("Only supported on Uniswap v1")
+        r = client.get_ex_eth_balance(tokens[token])
         assert r
 
-    @pytest.mark.parametrize("token", [(bat), (dai)])
+    @pytest.mark.parametrize("token", [("UNI"), ("DAI")])
     def test_get_ex_token_balance(
-        self, client: Uniswap, token,
+        self,
+        client: Uniswap,
+        tokens,
+        token,
     ):
         if not client.version == 1:
-            pytest.skip("Tested method only supported on Uniswap v1")
-        r = client.get_ex_token_balance(token)
+            pytest.skip("Only supported on Uniswap v1")
+        r = client.get_ex_token_balance(tokens[token])
         assert r
 
-    @pytest.mark.parametrize("token", [(bat), (dai)])
-    def get_exchange_rate(
-        self, client: Uniswap, token,
+    @pytest.mark.parametrize("token", [("UNI"), ("DAI")])
+    def test_get_exchange_rate(
+        self,
+        client: Uniswap,
+        tokens,
+        token,
     ):
-        r = client.get_exchange_rate(token)
+        if not client.version == 1:
+            pytest.skip("Only supported on Uniswap v1")
+        r = client.get_exchange_rate(tokens[token])
         assert r
 
     # ------ Liquidity -----------------------------------------------------------------
+    @pytest.mark.parametrize(
+        "token0, token1, amount0, amount1, qty, fee",
+        [
+            ("DAI", "USDC", ONE_ETH, ONE_USDC, ONE_ETH, 3000),
+        ],
+    )
+    def test_v3_deploy_pool_with_liquidity(
+        self, client: Uniswap, tokens, token0, token1, amount0, amount1, qty, fee
+    ):
+        if client.version != 3:
+            pytest.skip("Not supported in this version of Uniswap")
+
+        try:
+            pool = client.create_pool_instance(tokens[token0], tokens[token1], fee)
+        except Exception:
+            pool = client.get_pool_instance(tokens[token0], tokens[token1], fee)
+
+        print(pool.address)
+        # Ensuring client has sufficient balance of both tokens
+        eth_to_dai = client.make_trade(
+            tokens["ETH"], tokens[token0], qty, client.address
+        )
+        eth_to_dai_tx = client.w3.eth.wait_for_transaction_receipt(
+            eth_to_dai, timeout=RECEIPT_TIMEOUT
+        )
+        assert eth_to_dai_tx["status"]
+        dai_to_usdc = client.make_trade(
+            tokens[token0], tokens[token1], qty * 10, client.address
+        )
+        dai_to_usdc_tx = client.w3.eth.wait_for_transaction_receipt(
+            dai_to_usdc, timeout=RECEIPT_TIMEOUT
+        )
+        assert dai_to_usdc_tx["status"]
+
+        balance_0 = client.get_token_balance(tokens[token0])
+        balance_1 = client.get_token_balance(tokens[token1])
+
+        assert balance_0 > amount0, f"Have: {balance_0} need {amount0}"
+        assert balance_1 > amount1, f"Have: {balance_1} need {amount1}"
+
+        min_tick, max_tick = default_tick_range(fee)
+        r = client.mint_liquidity(
+            pool,
+            amount0,
+            amount1,
+            tick_lower=min_tick,
+            tick_upper=max_tick,
+            deadline=2 ** 64,
+        )
+        assert r["status"]
+
+        position_balance = client.nonFungiblePositionManager.functions.balanceOf(
+            _addr_to_str(client.address)
+        ).call()
+        assert position_balance > 0
+
+        position_array = client.get_liquidity_positions()
+        assert len(position_array) > 0
+
+    @pytest.mark.parametrize(
+        "deadline",
+        [(2 ** 64)],
+    )
+    def test_close_position(self, client: Uniswap, deadline):
+        if client.version != 3:
+            pytest.skip("Not supported in this version of Uniswap")
+        position_array = client.get_liquidity_positions()
+        tokenId = position_array[0]
+        r = client.close_position(tokenId, deadline=deadline)
+        assert r["status"]
+
+    @pytest.mark.parametrize("token0, token1", [("DAI", "USDC")])
+    def test_get_tvl_in_pool_on_chain(self, client: Uniswap, tokens, token0, token1):
+        if client.version != 3:
+            pytest.skip("Not supported in this version of Uniswap")
+
+        pool = client.get_pool_instance(tokens[token0], tokens[token1])
+        tvl_0, tvl_1 = client.get_tvl_in_pool(pool)
+        assert tvl_0 > 0
+        assert tvl_1 > 0
+
     @pytest.mark.skip
     @pytest.mark.parametrize(
         "token, max_eth",
         [
-            (bat, 0.00001 * ONE_ETH),
-            (dai, 0.00001 * ONE_ETH),
-            pytest.param("btc", ONE_ETH, marks=pytest.mark.xfail),
+            ("UNI", 0.00001 * ONE_ETH),
+            ("DAI", 0.00001 * ONE_ETH),
         ],
     )
-    def test_add_liquidity(self, client: Uniswap, web3: Web3, token, max_eth):
+    def test_add_liquidity(self, client: Uniswap, tokens, web3: Web3, token, max_eth):
+        token = tokens[token]
         r = client.add_liquidity(token, max_eth)
-        tx = web3.eth.waitForTransactionReceipt(r, timeout=6000)
-        assert tx.status  # type: ignore
+        tx = web3.eth.wait_for_transaction_receipt(r, timeout=RECEIPT_TIMEOUT)
+        assert tx["status"]
 
     @pytest.mark.skip
     @pytest.mark.parametrize(
         "token, max_token, expectation",
         [
-            (bat, 0.00001 * ONE_ETH, does_not_raise()),
-            (dai, 0.00001 * ONE_ETH, does_not_raise()),
-            ("btc", ONE_ETH, pytest.raises(InvalidToken)),
+            ("UNI", 0.00001 * ONE_ETH, does_not_raise()),
+            ("DAI", 0.00001 * ONE_ETH, does_not_raise()),
         ],
     )
     def test_remove_liquidity(
-        self, client: Uniswap, web3: Web3, token, max_token, expectation
+        self, client: Uniswap, web3: Web3, tokens, token, max_token, expectation
     ):
+        token = tokens[token]
         with expectation:
-            r = client.remove_liquidity(token, max_token)
-            tx = web3.eth.waitForTransactionReceipt(r)
-            assert tx.status  # type: ignore
+            r = client.remove_liquidity(tokens[token], max_token)
+            tx = web3.eth.wait_for_transaction_receipt(r)
+            assert tx["status"]
 
     # ------ Make Trade ----------------------------------------------------------------
     @pytest.mark.parametrize(
         "input_token, output_token, qty, recipient, expectation",
         [
             # ETH -> Token
-            (eth, bat, 1_000_000_000 * ONE_WEI, None, does_not_raise),
+            ("ETH", "DAI", ONE_ETH, None, does_not_raise),
             # Token -> Token
-            (bat, dai, 1_000_000_000 * ONE_WEI, None, does_not_raise),
+            ("DAI", "USDC", ONE_ETH, None, does_not_raise),
             # Token -> ETH
-            (bat, eth, 1_000_000 * ONE_WEI, None, does_not_raise),
-            # (eth, bat, 0.00001 * ONE_ETH, ZERO_ADDRESS, does_not_raise),
-            # (bat, eth, 0.00001 * ONE_ETH, ZERO_ADDRESS, does_not_raise),
-            # (dai, bat, 0.00001 * ONE_ETH, ZERO_ADDRESS, does_not_raise),
-            (dai, "btc", ONE_ETH, None, lambda: pytest.raises(InvalidToken)),
+            ("USDC", "ETH", ONE_USDC, None, does_not_raise),
+            # ("ETH", "UNI", 0.00001 * ONE_ETH, ZERO_ADDRESS, does_not_raise),
+            # ("UNI", "ETH", 0.00001 * ONE_ETH, ZERO_ADDRESS, does_not_raise),
+            # ("DAI", "UNI", 0.00001 * ONE_ETH, ZERO_ADDRESS, does_not_raise),
         ],
     )
     def test_make_trade(
         self,
         client: Uniswap,
         web3: Web3,
+        tokens,
+        test_assets,
         input_token,
         output_token,
         qty: int,
         recipient,
         expectation,
     ):
+        input_token, output_token = tokens[input_token], tokens[output_token]
+        if client.version == 1 and ETH_ADDRESS not in [input_token, output_token]:
+            pytest.skip(
+                "Not supported in this version of Uniswap, or at least no liquidity"
+            )
         with expectation():
             bal_in_before = client.get_token_balance(input_token)
 
-            r = client.make_trade(input_token, output_token, qty, recipient)
-            tx = web3.eth.waitForTransactionReceipt(r)
-            assert tx.status  # type: ignore
+            txid = client.make_trade(input_token, output_token, qty, recipient)
+            tx = web3.eth.wait_for_transaction_receipt(txid, timeout=RECEIPT_TIMEOUT)
+            assert tx["status"]
 
             # TODO: Checks for ETH, taking gas into account
             bal_in_after = client.get_token_balance(input_token)
-            if input_token != self.eth:
+            if input_token != tokens["ETH"]:
                 assert bal_in_before - qty == bal_in_after
 
     @pytest.mark.parametrize(
         "input_token, output_token, qty, recipient, expectation",
         [
             # ETH -> Token
-            (eth, bat, 1_000_000_000 * ONE_WEI, None, does_not_raise),
+            ("ETH", "DAI", ONE_ETH, None, does_not_raise),
             # Token -> Token
-            (bat, dai, 1_000_000_000 * ONE_WEI, None, does_not_raise),
+            ("DAI", "USDC", ONE_USDC, None, does_not_raise),
             # Token -> ETH
-            (dai, eth, 1_000_000 * ONE_WEI, None, does_not_raise),
+            ("DAI", "ETH", 100 * ONE_USDC, None, does_not_raise),
             # FIXME: These should probably be uncommented eventually
-            # (eth, bat, int(0.000001 * ONE_ETH), ZERO_ADDRESS),
-            # (bat, eth, int(0.000001 * ONE_ETH), ZERO_ADDRESS),
-            # (dai, bat, int(0.000001 * ONE_ETH), ZERO_ADDRESS),
+            # ("ETH", "UNI", int(0.000001 * ONE_ETH), ZERO_ADDRESS),
+            # ("UNI", "ETH", int(0.000001 * ONE_ETH), ZERO_ADDRESS),
+            # ("DAI", "UNI", int(0.000001 * ONE_ETH), ZERO_ADDRESS),
             (
-                dai,
-                eth,
-                10 ** 18 * ONE_WEI,
+                "DAI",
+                "ETH",
+                10 * ONE_ETH,
                 None,
                 lambda: pytest.raises(InsufficientBalance),
             ),
-            (dai, "btc", ONE_ETH, None, lambda: pytest.raises(InvalidToken)),
         ],
     )
     def test_make_trade_output(
         self,
         client: Uniswap,
         web3: Web3,
+        tokens,
+        test_assets,
         input_token,
         output_token,
         qty: int,
         recipient,
         expectation,
     ):
+        input_token, output_token = tokens[input_token], tokens[output_token]
+        if client.version == 1 and ETH_ADDRESS not in [input_token, output_token]:
+            pytest.skip(
+                "Not supported in this version of Uniswap, or at least no liquidity"
+            )
         with expectation():
             balance_before = client.get_token_balance(output_token)
 
             r = client.make_trade_output(input_token, output_token, qty, recipient)
-            tx = web3.eth.waitForTransactionReceipt(r, timeout=30)
-            assert tx.status  # type: ignore
+            tx = web3.eth.wait_for_transaction_receipt(r, timeout=RECEIPT_TIMEOUT)
+            assert tx["status"]
 
             # TODO: Checks for ETH, taking gas into account
             balance_after = client.get_token_balance(output_token)
-            if output_token != self.eth:
+            if output_token != tokens["ETH"]:
                 assert balance_before + qty == balance_after
